@@ -1,5 +1,5 @@
 defaults:
-  - FaiveHandP0
+  - FaiveHandP0Chunk
 
 # in-hand rotation of a sphere around a fixed axis
 # targeted towards sim2real;
@@ -10,6 +10,7 @@ defaults:
 
 env:
   object_type: ["sphere"]
+  numActions: 15 # 4 action_chunk_trigger + 11 actions
   controlFrequencyInv: 3  # 20 Hz control
   use_relative_control: True
   relative_control_speed_scale: 6.0  # 6 rad/s max
@@ -23,10 +24,9 @@ env:
                                 ]
 
 action_chunk: 
-  enable: false
-  model_path: null
+  enable: true
+  model_path: "/home/chenyu/workspace/vqbet_ws/media/vqace_model_20240904-123427/checkpoint_100.pth"
   chunk_selection_scale: 0.25 # 0.1  on average, trigger every 10 steps
-
 
 rewards:
   scales:
@@ -45,16 +45,21 @@ rewards:
   success_tolerance: 0
 
 observations:
+  obs_dims:
+    actions: 11 
+    next_norminal_actions: 11 # next step's actions (mean)
+    action_chunk_triggers: 4 #  one hot trigger for the action chunk
+
   asymmetric_observations: True
   # use only physically possible observations
   actor_observations: ["dof_pos_history",
                        "dof_pos_target",
-                       "actions"]
+                       "next_norminal_actions", "action_chunk_triggers"]
 
   critic_observations: ["dof_position", "dof_speed", "dof_force", "dof_pos_target",
                        "obj_pos", "obj_quat", "obj_linvel", "obj_angvel_numerical",
                        "pose_sensor_pos", "pose_sensor_quat", "pose_sensor_linvel", "pose_sensor_angvel", "force_sensor_force",
-                       "actions"]
+                       "actions", "next_norminal_actions", "action_chunk_triggers"]
 
 logging:
   rt_plt: False

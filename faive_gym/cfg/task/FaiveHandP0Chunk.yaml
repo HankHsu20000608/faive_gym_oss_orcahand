@@ -7,13 +7,12 @@ defaults:
 name: RobotHand
 
 env:
-  numActions: 11 # 4 action_chunk_trigger + 11 actions
+  numActions: 15 # 4 action_chunk_trigger + 11 actions
   object_start_offset: [0, -0.15, 0.07]
 
-
 action_chunk: 
-  enable: false
-  model_path: null
+  enable: true
+  model_path: "/home/chenyu/workspace/vqbet_ws/media/vqace_model_20240904-123427/checkpoint_100.pth"
 
 asset:
   model_file: "faive_hand_p0/faive_hand.xml"
@@ -41,14 +40,14 @@ observations:
     pose_sensor_linvel: 15  # 3 * 5
     pose_sensor_angvel: 15  # 3 * 5
     force_sensor_force: 30  # 6 * 5
-    actions: 11 
+    actions: 15 
     obj_pose_history: 35 # 7 dof pose * 5 history length
     dof_pos_history: 55  # 11 dof joint * 5 history length
-    # next_norminal_actions: 11 # next step's actions (mean)
-    # action_chunk_triggers: 4 #  one hot trigger for the action chunk
+    next_norminal_actions: 11 # next step's actions (mean)
+    action_chunk_triggers: 4 #  one hot trigger for the action chunk
 
   actor_observations: ["dof_position", "dof_speed", "dof_force",
                        "obj_pos", "obj_quat", "obj_linvel", "obj_angvel",
                        "goal_pos", "goal_quat", "goal_quat_diff",
                        "pose_sensor_pos", "pose_sensor_quat", "pose_sensor_linvel", "pose_sensor_angvel", "force_sensor_force",
-                       "actions"]
+                       "actions", "next_norminal_actions", "action_chunk_triggers"]

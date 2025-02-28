@@ -175,6 +175,20 @@ class RobotHand(VecTask):
         self.prev_targets = torch.zeros(
             (self.num_envs, num_dofs), dtype=torch.float, device=self.device
         )
+        if self.cfg["action_chunk"]["enable"]:
+            chunk_trigger_scale = self.cfg["action_chunk"]["chunk_selection_scale"]
+            max_chunk_size = int(1/chunk_trigger_scale+1)
+
+            self.action_chunk_buffer = torch.zeros(
+                (self.num_envs, max_chunk_size, num_dofs), dtype=torch.float, device=self.device
+            )
+            self.action_chunk_pointer = torch.zeros(
+                (self.num_envs, 1), dtype=torch.int, device=self.device
+            )
+            self.action_chunk_triggers = torch.zeros(
+                (self.num_envs, 4), dtype=torch.float, device=self.device
+            )
+            self.action_chunk_analysis_selections = torch.zeros((4, ), dtype=torch.float, device = self.device)        
 
         self.x_unit_tensor = to_torch(
             [1, 0, 0], dtype=torch.float, device=self.device
@@ -267,17 +281,55 @@ class RobotHand(VecTask):
         actions = torch.clip(actions, -clip_actions, clip_actions)
         self.actions = actions.to(self.device)
 
+        if self.cfg["action_chunk"]["enable"]:
+            joint_actions = self.actions[:, 4:]
+        else:
+            joint_actions = self.actions
+
+
         if self.cfg["env"]["use_relative_control"]:
             targets = (
                 self.prev_targets[:, self.actuated_dof_indices]
-                + self.cfg["env"]["relative_control_speed_scale"] * self.control_dt * self.actions
+                + self.cfg["env"]["relative_control_speed_scale"] * self.control_dt * joint_actions
             )
         else:
             targets = scale(
-                self.actions,
+                joint_actions,
                 self.actuated_dof_lower_limits,
                 self.actuated_dof_upper_limits,
             )
+
+        if self.cfg["action_chunk"]["enable"]:
+            # apply the action chunking
+            chunk_trigger_scale = self.cfg["action_chunk"]["chunk_selection_scale"]
+            max_chunk_size = int(1/chunk_trigger_scale+1)
+            self.action_chunk_triggers += chunk_trigger_scale + self.actions[:,:4] * chunk_trigger_scale
+            trigged_max = self.action_chunk_triggers.max(dim=1)
+            trigged_mask = trigged_max.values > 1.0
+            # run decoder
+            if trigged_mask.any():
+                qpos = self.hand_dof_pos[trigged_mask][:, self.actuated_dof_indices].clone()
+                qpos[:, 1:] /= 2 # conversion of the rolling joint # [bs, 11]
+                z = trigged_max.indices[trigged_mask].unsqueeze(1)
+                for i in range(4):
+                    self.action_chunk_analysis_selections[i] = (z==i).sum()
+                action_chunk = self.vqace_decoder(z, qpos)
+                action_chunk[:, :, 1:] *= 2 # conversion of the rolling joint #[bs, 10, 11]
+                action_chunk = action_chunk.permute(0, 2, 1)
+                action_chunk = torch.nn.functional.interpolate(action_chunk, size=max_chunk_size,
+                                                             mode="linear", align_corners=False)
+                action_chunk = action_chunk.permute(0, 2, 1)
+                if self.cfg["env"]["use_relative_control"]: # if relative control is enabled, then change it to differencial each step
+                    action_chunk[:,1:,:] = action_chunk[:,1:,:] - action_chunk[:,:-1,:]
+                    action_chunk[:,0,:] = action_chunk[:,0,:] - self.hand_dof_pos[trigged_mask][:, self.actuated_dof_indices]
+                self.action_chunk_buffer[trigged_mask][:,:, self.actuated_dof_indices] = action_chunk
+                # reset the action chunk triggers and points
+                self.action_chunk_triggers[trigged_mask] = torch.rand_like(self.action_chunk_triggers[trigged_mask]) * 0.8
+                self.action_chunk_pointer[trigged_mask] = 0
+            targets += self._observation_next_norminal_actions()
+            self.action_chunk_pointer = torch.clamp(self.action_chunk_pointer+1, 0, max_chunk_size-1)
+
+
         self.cur_targets[:, self.actuated_dof_indices] = tensor_clamp(
             targets, self.actuated_dof_lower_limits, self.actuated_dof_upper_limits
         )
@@ -359,6 +411,10 @@ class RobotHand(VecTask):
         self.extras["min_rotvel_x"] = self.object_angvel_numerical[:,0].min().item()
         self.extras["max_rotvel_x"] = self.object_angvel_numerical[:,0].max().item()
         self.extras["std_rotvel_x"] = self.object_angvel_numerical[:,0].std().item()
+        if self.cfg["action_chunk"]["enable"]:
+            for i in range(4):
+                self.extras[f"action_chunk/selections_{i}"] = self.action_chunk_analysis_selections[i]
+            self.extras[f"action_chunk/pointer"] = self.action_chunk_pointer.to(torch.float).mean()
         self.compute_observations()
 
         # visualize
@@ -596,6 +652,12 @@ class RobotHand(VecTask):
                 reset_indices = torch.cat(
                     (reset_indices, self.hand_indices[env_ids].to(torch.int32))
                 )
+            if self.cfg["action_chunk"]["enable"]:
+            # reset the vqace related variables
+                self.action_chunk_buffer[env_ids] = 0
+                self.action_chunk_pointer[env_ids] = 0
+                self.action_chunk_triggers[env_ids] = torch.rand_like(self.action_chunk_triggers[env_ids]) * 0.9
+                
             # reset buffers
             self.progress_buf[env_ids] = 0
 
@@ -895,6 +957,11 @@ class RobotHand(VecTask):
         self.gym.add_ground(self.sim, plane_params)
 
     def _create_envs(self):
+        if self.cfg["action_chunk"]["enable"]:
+            from hand_action_embed.export.vqace import factory as vqace_factory
+            model_path = self.cfg["action_chunk"]["model_path"]
+            self.vqace_decoder = vqace_factory(model_path)
+
         env_lower = gymapi.Vec3(
             -self.cfg["env"]["env_spacing"], -self.cfg["env"]["env_spacing"], 0.0
         )
@@ -1573,9 +1640,27 @@ class RobotHand(VecTask):
         """
         Returns the latest actions from the policy
         """
-        
-        return self.actions
+        if self.cfg["action_chunk"]["enable"]:
+            return self.actions[:,4:]
+        return self.actions 
     
+    def _observation_next_norminal_actions(self):
+        """
+        Returns the latest actions from the policy
+        """
+        
+        # return self.action_chunk_buffer[self.action_chunk_pointer]
+        pointer_indices = self.action_chunk_pointer.squeeze(1).long()
+        # Gather the current action tensors from the buffer using pointer indices
+        current_action_tensor = self.action_chunk_buffer[torch.arange(self.num_envs), pointer_indices]
+        return current_action_tensor[:, self.actuated_dof_indices]
+    
+    def _observation_action_chunk_triggers(self):
+        """
+        Returns the latest actions from the policy
+        """
+        
+        return self.action_chunk_triggers
 
 
 @torch.jit.script

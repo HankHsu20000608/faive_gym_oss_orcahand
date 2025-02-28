@@ -148,6 +148,7 @@ def launch_rlg_hydra(cfg: DictConfig):
 
         return runner
 
+    cfg.train.params.config.name = run_name
     rlg_config_dict = omegaconf_to_dict(cfg.train)
 
     # convert CLI arguments into dictionory
