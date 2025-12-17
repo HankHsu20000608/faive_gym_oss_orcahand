@@ -13,6 +13,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""
+conda activate rlhand
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+cd Desktop/orca_hand/faive_gym_oss/faive_gym
+python train.py num_envs=2 task=orcahand_random
+python train.py task=orcahand_random   wandb_activate=True   wandb_entity=comp4471   wandb_project=rl_OrcaHand   wandb_group=Orca   wandb_name=test_run_orcarandom
+python train.py task=orcahand num_envs=1 test=True force_render=True checkpoint=runs/FaiveHand/nn/FaiveHand.pth
+
+
+"""
 
 from isaacgym import gymtorch, gymapi, gymutil
 from isaacgym.torch_utils import (
@@ -112,6 +122,7 @@ class RobotHand(VecTask):
         """
         Initialize buffers (torch tensors) that will contain simulation states
         """
+        self._dbg_step_counter = 0
         # get gym GPU state tensors
         actor_root_state_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
         dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
@@ -123,9 +134,10 @@ class RobotHand(VecTask):
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
-        self.gym.refresh_force_sensor_tensor(self.sim)
+        
         self.gym.refresh_dof_force_tensor(self.sim)
-
+        if len(self.force_sensor_handles)>0:
+            self.gym.refresh_force_sensor_tensor(self.sim)
         # save as appropriately shaped torch tensors
         self.root_state_tensor = gymtorch.wrap_tensor(actor_root_state_tensor).view(
             -1, 13
@@ -162,12 +174,17 @@ class RobotHand(VecTask):
         self.pose_sensor_state = self.rigid_body_states[:, self.pose_sensor_handles][
             :, :, 0:13
         ]
-        self.vec_sensor_tensor = gymtorch.wrap_tensor(sensor_tensor).view(
-            self.num_envs, -1
-        )
-        assert self.vec_sensor_tensor.shape[1] % 6 == 0  # sanity check
+        print("sensor_tensor= ",str(sensor_tensor))
+        if len(self.force_sensor_handles)==0:
+            self.vec_sensor_tensor = torch.zeros((self.num_envs, 0), dtype=torch.float, device=self.device)
+        else:
+            self.vec_sensor_tensor = gymtorch.wrap_tensor(sensor_tensor).view(
+                self.num_envs, -1
+            )
+            assert self.vec_sensor_tensor.shape[1] % 6 == 0  # sanity check
 
         num_dofs = self.gym.get_sim_dof_count(self.sim) // self.num_envs
+        print("debug: sim DOF count= ", str(num_dofs))
         # current position control targets for each joint (joints with no actuators should be set to 0)
         self.cur_targets = torch.zeros(
             (self.num_envs, num_dofs), dtype=torch.float, device=self.device
@@ -313,11 +330,18 @@ class RobotHand(VecTask):
         ]
 
         # update the history buffers
-        self.obj_pose_buffer[:,:-7] = self.obj_pose_buffer[:,7:]
+        #older pytorch version
+        #self.obj_pose_buffer[:,:-7] = self.obj_pose_buffer[:,7:]
+        #self.dof_pos_buffer[:,:-self.num_actuated_dofs] = self.dof_pos_buffer[:,self.num_actuated_dofs:]
+
+        #newer pythorch version 2.4.x
+        self.obj_pose_buffer[:, :-7] = self.obj_pose_buffer[:, 7:].clone()
         self.obj_pose_buffer[:,-7:] = self.object_pose.clone()
         self.obj_pose_buffer[:,-7:-4] -= self.object_init_states[:, :3]  # try to have zero mean
 
-        self.dof_pos_buffer[:,:-self.num_actuated_dofs] = self.dof_pos_buffer[:,self.num_actuated_dofs:]
+        self.dof_pos_buffer[:, :-self.num_actuated_dofs] = \
+        self.dof_pos_buffer[:, self.num_actuated_dofs:].clone()
+
         self.dof_pos_buffer[:,-self.num_actuated_dofs:] = unscale(
             self.hand_dof_pos[:, self.actuated_dof_indices],
             self.actuated_dof_lower_limits,
@@ -388,6 +412,8 @@ class RobotHand(VecTask):
         # update logger
         if self.cfg["logging"]["rt_plt"]:
             self.get_logs()
+        
+
 
     def record_step(self):
         '''
@@ -496,6 +522,80 @@ class RobotHand(VecTask):
         """
         return torch.zeros(0, device=torch.device(self.device))
 
+    
+    def _randomize_object_props_manual(self, env_ids):
+        """
+        Manual domain randomization for object mass / friction / size.
+        Works on actors (per-env), no asset-level API required.
+        """
+        import numpy as np
+
+        dr_params = self.cfg["task"]["randomization_params"]
+        obj_dr = dr_params["actor_params"]["object"]
+
+        mass_cfg  = obj_dr.get("rigid_body_properties", {}).get("mass", None)
+        fric_cfg  = obj_dr.get("rigid_shape_properties", {}).get("friction", None)
+        scale_cfg = obj_dr.get("scale", None)
+
+        # Lazily record the *default* body masses from env 0, actor index 1 (= object)
+        if mass_cfg is not None and not hasattr(self, "object_default_masses"):
+            env0 = self.envs[0]
+            obj_handle0 = self.gym.get_actor_handle(env0, 1)   # 0=hand, 1=object, 2=goal_object
+            rb_props0 = self.gym.get_actor_rigid_body_properties(env0, obj_handle0)
+            self.object_default_masses = [p.mass for p in rb_props0]
+            #print("[DR] cached default object masses:", self.object_default_masses)
+
+        for env_id_t in env_ids:
+            env_id = int(env_id_t)
+            env = self.envs[env_id]
+
+            # In this build, actor index 1 is always the object (see _create_envs)
+            obj_handle = self.gym.get_actor_handle(env, 1)
+
+            # ---------- 1) MASS ----------
+            if mass_cfg is not None:
+                lo, hi = mass_cfg["range"]
+                mass_scale = np.random.uniform(lo, hi)
+
+                rb_props = self.gym.get_actor_rigid_body_properties(env, obj_handle)
+                for b, rb in enumerate(rb_props):
+                    rb.mass = self.object_default_masses[b] * mass_scale
+                self.gym.set_actor_rigid_body_properties(env, obj_handle, rb_props, True)
+
+                #print(f"[DR] env {env_id} – mass_scale={mass_scale:.3f}, "
+                #      f"body0_mass={rb_props[0].mass:.6f}")
+
+            # ---------- 2) FRICTION ----------
+            if fric_cfg is not None:
+                lo_f, hi_f = fric_cfg["range"]
+                fric_scale = np.random.uniform(lo_f, hi_f)
+
+                shape_props = self.gym.get_actor_rigid_shape_properties(env, obj_handle)
+                for sp in shape_props:
+                    sp.friction *= fric_scale
+                self.gym.set_actor_rigid_shape_properties(env, obj_handle, shape_props)
+
+                # Optional debug:
+                # print(f"[DR] env {env_id} – fric_scale={fric_scale:.3f}, "
+                #       f"shape0_friction={shape_props[0].friction:.3f}")
+
+            # ---------- 3) SIZE / SCALE ----------
+            if scale_cfg is not None and hasattr(self.gym, "set_actor_scale"):
+                lo_s, hi_s = scale_cfg["range"]
+                scale = np.random.uniform(lo_s, hi_s)
+
+                self.gym.set_actor_scale(env, obj_handle, scale)
+
+                # Optionally keep density roughly constant by rescaling mass ~ scale^3
+                if mass_cfg is not None:
+                    rb_props = self.gym.get_actor_rigid_body_properties(env, obj_handle)
+                    for b, rb in enumerate(rb_props):
+                        rb.mass = self.object_default_masses[b] * (scale ** 3)
+                    self.gym.set_actor_rigid_body_properties(env, obj_handle, rb_props, True)
+
+                #print(f"[DR] env {env_id} – size_scale={scale:.3f}")
+    
+
     def reset_idx(self, env_ids, goal_env_ids=[]):
         """
         Reset the envs (the robot dofs and the object pose) in env_ids and
@@ -504,7 +604,18 @@ class RobotHand(VecTask):
         #TODO ... fix it if it becomes a problem
         """
         if self.cfg["task"]["randomize"]:
-            self.apply_randomizations(self.cfg["task"]["randomization_params"])
+            #the apply_randomizations is only working when creating sim. see description of apply_randomizations(). 
+            #self.apply_randomizations(self.cfg["task"]["randomization_params"])
+            self._randomize_object_props_manual(env_ids)
+            """
+            # DEBUG: print randomized mass for env 0, body 0
+            env0 = self.envs[0]
+            # self.object_indices is a torch tensor of actor indices in SIM domain
+            obj_handle0 = self.gym.get_actor_handle(env0, 1)
+            rb_props = self.gym.get_actor_rigid_body_properties(env0, obj_handle0)
+            print("[DEBUG] create() - object mass body 0:", rb_props[0].mass)
+            """
+            
 
         # keep track of which indices of the root state tensor should be reset at the end of this function
         reset_indices = torch.zeros(0, device=torch.device(self.device)).to(torch.int32)
@@ -805,19 +916,47 @@ class RobotHand(VecTask):
                     return [obs_tensor[env_idx,obs_idx*5+i].item() for i in range(num_lines)]
                 else:
                     return obs_tensor[env_idx, obs_idx].item()
-
+    
     def compute_reward(self):
-        """
-        Calls each reward function which has a non-zero scale (processed in self._prepare_reward_function)
-        adds each terms to the episode sums and to the total reward
-        """
-        self.rew_buf[:] = 0
+        self.rew_buf[:] = 0.0
+
+        # --- debug throttle ---
+        if not hasattr(self, "_dbg_step"):
+            self._dbg_step = 0
+        self._dbg_step += 1
+
+        dbg_every = 200  # change this
+        do_dbg = (self._dbg_step % dbg_every == 0)
+
+        if do_dbg:
+            print(f"[Reward DEBUG] step={self._dbg_step}")
+
         for reward_name, reward_func in zip(self.reward_names, self.reward_functions):
-            if self.reward_scales[reward_name] == 0:
-                continue  # ignore zero-scaled rewards
-            reward = reward_func() * self.reward_scales[reward_name]
-            self.rew_buf += reward
-            self.rewards_dict[f"rew_{reward_name}"] = reward.mean()
+            scale = self.reward_scales[reward_name]
+            if scale == 0:
+                continue
+
+            raw = reward_func()  # should be (num_envs,)
+
+            # make it safe for scaling/printing
+            if raw.dtype == torch.bool or (not raw.is_floating_point()):
+                raw = raw.float()
+
+            scaled = raw * scale
+            self.rew_buf += scaled
+
+            # log something lightweight for wandb (optional)
+            self.rewards_dict[f"rew_{reward_name}"] = scaled.mean()
+
+            # print EVERYTHING (per-env)
+            if do_dbg:
+                # move to CPU for readable print; this syncs GPU, so only do it occasionally
+                raw_cpu = raw.detach().cpu()
+                scaled_cpu = scaled.detach().cpu()
+                print(f"  {reward_name:16s} raw={raw_cpu} | scaled={scaled_cpu}")
+                t = self.dof_force_tensor
+                print("dof_force abs max:", torch.abs(t).max().item(), "mean:", torch.abs(t).mean().item())
+
 
     def _fill_obs(self, obs_tensor, obs_names, obs_functions):
         """
@@ -957,6 +1096,14 @@ class RobotHand(VecTask):
 
         # define some variables based on the asset
         self.num_hand_bodies = self.gym.get_asset_rigid_body_count(hand_asset)
+        body_names = [
+            self.gym.get_asset_rigid_body_name(hand_asset, i)
+            for i in range(self.num_hand_bodies)
+        ]
+        print("[ORCA] Rigid bodies in ORCA asset:")
+        for i, n in enumerate(body_names):
+            print(f"  {i}: {n}")
+        
         self.num_hand_shapes = self.gym.get_asset_rigid_shape_count(hand_asset)
         self.num_hand_dofs = self.gym.get_asset_dof_count(hand_asset)
         self.num_hand_actuators = self.gym.get_asset_actuator_count(hand_asset)
@@ -993,7 +1140,15 @@ class RobotHand(VecTask):
 
         # get hand dof properties, loaded by Isaac Gym from the MJCF file
         hand_dof_props = self.gym.get_asset_dof_properties(hand_asset)
+        if self.num_hand_actuators == 0 and "orcahand" in hand_asset_file.lower():
+            print("[RobotHand] Configuring ORCA hand PD gains")
 
+            # Position control for all joints
+            hand_dof_props["driveMode"][:] = gymapi.DOF_MODE_POS
+
+            # PD gains – starting guess, you can tune these
+            hand_dof_props["stiffness"][:] = 1800.0   # try 800–2500
+            hand_dof_props["damping"][:]   = 180.0    # try 60–200
         # load joint range information
         self.hand_dof_lower_limits = []
         self.hand_dof_upper_limits = []
@@ -1022,6 +1177,17 @@ class RobotHand(VecTask):
             self.hand_dof_default_vel, device=self.device
         )
         self.num_actuated_dofs = len(self.actuated_dof_indices)
+        if self.num_actuated_dofs == 0:
+            print("[RobotHand] Warning: no actuated DOFs detected – using all DOFs as actuated.")
+            self.actuated_dof_indices = torch.arange(
+                17,
+                dtype=torch.long,
+                device=self.device,
+            )
+            self.num_actuated_dofs = self.actuated_dofs = self.actuated_dof_indices.numel() \
+                if hasattr(self, 'actuated_dofs') else self.actuated_dof_indices.numel()
+        print("actuated_dof_indices:", self.actuated_dof_indices)
+        print("num_actuated_dofs:", self.num_actuated_dofs)
         # if using tendons to simulate rolling contact joints, only some of the dofs have actuators
         # they should be all you need to reconstruct the hand's full state, so use these dofs for observations as well
         self.actuated_dof_lower_limits = self.hand_dof_lower_limits[
@@ -1100,6 +1266,7 @@ class RobotHand(VecTask):
                                         self.cfg['env']['hand_start_r'][2],
                                         self.cfg['env']['hand_start_r'][3])
         [pose_dx, pose_dy, pose_dz] = self.cfg["env"]["object_start_offset"]  # position the object above the palm
+        
 
         object_start_pose.p.x = hand_start_pose.p.x + pose_dx
         object_start_pose.p.y = hand_start_pose.p.y + pose_dy
@@ -1241,6 +1408,7 @@ class RobotHand(VecTask):
         )
 
 
+
     def _parse_cfg(self, cfg):
         """
         Parse the configuration object and save relevant parameters
@@ -1301,30 +1469,51 @@ class RobotHand(VecTask):
     # for readability, rewards specific to a task should be named [task_name]task_[reward_name]
 
     # first define generic reward functions that can be used for any task
-
+    def _reward_toss_penalty(self):
+        """
+        Penalize tossing of the object. limit the speed of object.
+        """
+        obj_linvel = self._observation_obj_linvel()     # (N,3)
+        speed = torch.norm(obj_linvel, dim=1)          # |v|
+        return speed * speed
+    
     def _reward_dof_acc_penalty(self):
         """
         Penalize joint acceleration, could remove shaking
-        """
         return torch.norm(self.dof_acceleration, p=2, dim=-1)
+        """
+        #return torch.norm(self.dof_acceleration, p=2, dim=-1)
+
+        dof_trq = self.dof_force_tensor  # (E, D)
+        return torch.mean(dof_trq**2, dim=-1)  # (E,)
+        
+     
 
     def _reward_dof_vel_penalty(self):
         """
         Penalize speed of the joints, smooth out movement
-        """
         return torch.norm(self.hand_dof_vel, p=2, dim=-1)
+        """
+        dof_vel_threshold = 2.0
+        vel_excess = torch.clamp(torch.abs(self.hand_dof_vel) - dof_vel_threshold, min=0.0)
+        return torch.mean(vel_excess ** 2, dim=-1)   # -> (num_envs,)
 
     def _reward_action_penalty(self):
         """
         Penalize the magnitude of the action
         """
-        return torch.norm(self.actions, p=2, dim=-1)
+        #return torch.norm(self.actions, p=2, dim=-1)
+        return torch.sum(self.actions ** 2, dim=-1)
 
     def _reward_dof_trq_penalty(self):
         """
         Penalize the magnitude of the joint torque
-        """
         return torch.norm(self.dof_force_tensor, p=2, dim=-1)
+        """
+        dof_trq = self.dof_force_tensor  # shape (num_envs, num_dofs) typically
+        dof_trq_threshold = 1.0
+        trq_excess = torch.clamp(torch.abs(dof_trq) - dof_trq_threshold, min=0.0)
+        return torch.norm(trq_excess, p=2, dim=-1)
 
     def _reward_success(self):
         """

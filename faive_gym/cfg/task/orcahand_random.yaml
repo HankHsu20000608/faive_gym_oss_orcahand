@@ -1,0 +1,76 @@
+# load the default environment parameters, and override the ones we want to change
+defaults:
+  - RobotHandDefault
+
+# The base RobotHand class suffices for the default P0 robot for now
+name: RobotHand
+
+env:
+  numActions: 17
+  object_start_offset: [0.085, -0.2, 0.05]
+  hand_start_r: [ 0.7071068, 0, 0, 0.7071068 ]
+  hand_start_p: [0,0,1]
+  hand_reset_dof_pos: null
+  hand_reset_dof_vel: 0.0
+
+asset:
+  model_file: "orcahand_description/models/urdf/orcahand_right.urdf"
+  force_sensor_names: []   # no force sensors for now
+  pose_sensor_names: ["right_index_fingertip", "right_middle_fingertip",
+                      "right_pinky_fingertip", "right_ring_fingertip",
+                      "right_thumb_fingertip"]
+
+observations:
+  obs_dims:
+    dof_position: 17
+    dof_pos_target: 17
+    dof_speed: 17
+    dof_speed_numerical: 17
+    dof_force: 17
+    obj_pos: 3
+    obj_quat: 4
+    obj_linvel: 3
+    obj_angvel: 3
+    obj_linvel_numerical: 3
+    obj_angvel_numerical: 3
+    goal_pos: 3
+    goal_quat: 4
+    goal_quat_diff: 4
+    pose_sensor_pos: 15       # 3 * 5
+    pose_sensor_quat: 20      # 4 * 5
+    pose_sensor_linvel: 15    # 3 * 5
+    pose_sensor_angvel: 15    # 3 * 5
+    actions: 17
+    obj_pose_history: 35      # 7 * 5
+    dof_pos_history: 85       # 17 * 5
+
+  # IMPORTANT: override the default observation lists to DROP force_sensor_force
+  actor_observations:
+    - dof_position
+    - dof_speed
+    - dof_force
+    - obj_pos
+    - obj_quat
+    - obj_linvel
+    - obj_angvel
+    - goal_pos
+    - goal_quat
+    - goal_quat_diff
+    - pose_sensor_pos
+    - pose_sensor_quat
+    - pose_sensor_linvel
+    - pose_sensor_angvel
+    - actions
+
+  student_observations:
+    - dof_position
+    - dof_speed
+    - dof_force
+    - obj_pos
+    - obj_quat
+    - obj_linvel
+    - obj_angvel
+    - goal_pos
+    - goal_quat
+    - goal_quat_diff
+    - actions
