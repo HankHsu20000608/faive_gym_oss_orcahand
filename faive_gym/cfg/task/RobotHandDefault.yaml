@@ -53,7 +53,7 @@ logging:
   rt_plt: False
   record_dofs: False
   record_observations: False
-  record_length: 10
+  record_length: 1000 # e.g. 500 steps at 30 Hz ≈ 16.7 s
   buf_len_s: 0.6
   num_rows: 2
   num_cols: 3 #  multiplication of rows and cols should be equal to the 
@@ -77,18 +77,23 @@ rewards:
     # These are read in faive_hand.py (_prepare_reward function) and the
     # corresponding reward functions (with the name "_reward_{name}")
     # are called
+  
+    spin_clockwise: 1.0         # new main objective (positive)
+    
 
-    toss_penalty: -0.002
-    action_penalty: -0.00002
-    dof_acc_penalty: -0.0001  # 0.0
-    dof_vel_penalty: -0.000001  # 0.0
+    toss_penalty: -0.02 
+    
+
+    action_penalty: -0.000002
+    dof_acc_penalty: -0.0005  # 0.0
+    dof_vel_penalty: -0.5  # 0.0
     dof_trq_penalty: -0.001 #0.0
-    success: 10.0
+    success: 0.0 #3.0
     drop_penalty: -0.0001
     simple_hand_flat: 0.0
-    
+  
     reorienttask_obj_dist: -0.05
-    reorienttask_obj_rot: 0.01
+    reorienttask_obj_rot: 0.0 #0.01
 
   success_tolerance: 0.1
   fall_dist_threshold: 0.5
@@ -132,7 +137,6 @@ observations:
     dof_pos_history: 2.0
     obj_type: 1.0
 
-
   # if True, feed different observations to the actor and critic (e.g. when you want to send privileged information to the critic)
   # otherwise, the actor_observations is used for both actor and critic
   asymmetric_observations: False
@@ -165,26 +169,30 @@ reset_noise:
 
 task:
   randomize: True
+  spin: 
+    target_wz: 6.0   # rad/s, tune (start 2~6)
+    wz_k: 0.2        # tracking sharpness (start 0.05~0.3)
+    tilt_k: 5.0      # upright importance (start 2~10)
   randomization_params:
     frequency: 1
     actor_params:
       object:
         rigid_body_properties:
           mass:
-            range: [0.7, 1.8]
+            range: [0.9, 1.0]
             operation: "scaling"        
             distribution: "uniform"
             setup_only: False
 
         rigid_shape_properties:
           friction:
-            range: [0.7, 1.0]
+            range: [0.8, 1.0]
             operation: "scaling"        
             distribution: "uniform"
             setup_only: False
 
         scale:
-          range: [0.7, 1.1]
+          range: [1.0, 1.0001]
           operation: "scaling"          
           distribution: "uniform"
           setup_only: False

@@ -151,7 +151,7 @@ class RobotHand(VecTask):
         self.dof_force_tensor = gymtorch.wrap_tensor(dof_force_tensor).view(
             self.num_envs, -1
         )
-
+        self.net_contact_force = gymtorch.wrap_tensor(self.gym.acquire_net_contact_force_tensor(self.sim))
         # next, define new member variables that make it easier to access the state tensors
         # if arrays are not used for indexing, the sliced tensors will be views of the original tensors, and thus their values will be automatically updated
         # Since it uses the first self.num_hand_dofs values of the dof state,
@@ -302,6 +302,10 @@ class RobotHand(VecTask):
         self.gym.set_dof_position_target_tensor(
             self.sim, gymtorch.unwrap_tensor(self.cur_targets)
         )
+    def _object_contact_mag(self):
+        # net_contact_force shape: (num_bodies_total, 3)
+        f = self.net_contact_force[self.object_rb_indices]  # (num_envs, 3)
+        return torch.norm(f, dim=-1)                        # (num_envs,)
 
     def post_physics_step(self):
         self.progress_buf += 1
@@ -312,7 +316,8 @@ class RobotHand(VecTask):
         self.gym.refresh_rigid_body_state_tensor(self.sim)
         self.gym.refresh_force_sensor_tensor(self.sim)
         self.gym.refresh_dof_force_tensor(self.sim)
-
+        self.gym.refresh_net_contact_force_tensor(self.sim)
+        
         # compute tensors for accessing specific parts of the state tensors
         # since it uses an array for indexing, it's not possible (afaik -Yasu) to make them reference the same memory and have them update automatically, like how self.hand_dof_pos is done
         self.object_pose = self.root_state_tensor[self.object_indices, 0:7]
@@ -328,7 +333,7 @@ class RobotHand(VecTask):
         self.pose_sensor_state[:] = self.rigid_body_states[:, self.pose_sensor_handles][
             :, :, 0:13
         ]
-
+        
         # update the history buffers
         #older pytorch version
         #self.obj_pose_buffer[:,:-7] = self.obj_pose_buffer[:,7:]
@@ -463,7 +468,13 @@ class RobotHand(VecTask):
         self.consecutive_successes = torch.where(num_successes > 0, av_factor * finished_consecutive_successes / num_successes + (1.0 - av_factor) * self.consecutive_successes, self.consecutive_successes)
         self.successes[self.reset_buf] = 0
 
-    def reset_goal_states(self, env_ids):
+    def _quat_yaw_only(self, yaw_rad: torch.Tensor):
+        # yaw_rad: (N,)
+        z_axis = torch.zeros((yaw_rad.shape[0], 3), device=self.device)
+        z_axis[:, 2] = 1.0
+        return quat_from_angle_axis(yaw_rad, z_axis)  # (N,4) xyzw
+    
+    def reset_goal_states_old(self, env_ids):
         """
         reset the goal states for env_ids
         update self.goal_states (shape (num_envs, 7))
@@ -474,16 +485,23 @@ class RobotHand(VecTask):
         rand_floats_goal = torch_rand_float(
             -1.0, 1.0, (len(env_ids), 2), self.device
         )
+        rand_yaw = torch_rand_float(-1.0, 1.0, (len(env_ids), 1), self.device).squeeze(-1)
         self.goal_states[env_ids] = self.object_init_states[env_ids].clone()
         # lower it to match the height of the hand
         self.goal_states[env_ids, 2] -= 0.04
-        # reset goal orientation
+        # reset goal orientation(yaw only)
+        yaw = rand_yaw * torch.pi  # [-pi, pi]
+        self.goal_states[env_ids, 3:7] = self._quat_yaw_only(yaw)
+        """
         self.goal_states[env_ids, 3:7] = randomize_rotation(
             rand_floats_goal[:, 0],
             rand_floats_goal[:, 1],
             self.x_unit_tensor[env_ids],
             self.y_unit_tensor[env_ids],
         )
+        """
+        # reset goal orientation
+        
         self.resetted_visual_goal_states = self.goal_states[env_ids].clone()
         goal_visual_displacement = [-0.2, -0.06, 0.08]
         # the goal object within the rendered scene will be displaced by this amount from the actual goal
@@ -491,12 +509,24 @@ class RobotHand(VecTask):
         self.resetted_visual_goal_states[:, 1] += goal_visual_displacement[1]
         self.resetted_visual_goal_states[:, 2] += goal_visual_displacement[2]
 
+    def reset_goal_states(self, env_ids):
+        self.goal_states[env_ids] = self.object_init_states[env_ids].clone()
+        self.goal_states[env_ids, 2] -= 0.04
     
+        # Fixed goal orientation (identity quaternion)
+        self.goal_states[env_ids, 3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
+    
+        # Keep visualization offset if you want
+        self.resetted_visual_goal_states = self.goal_states[env_ids].clone()
+        goal_visual_displacement = [-0.2, -0.06, 0.08]
+        self.resetted_visual_goal_states[:, 0] += goal_visual_displacement[0]
+        self.resetted_visual_goal_states[:, 1] += goal_visual_displacement[1]
+        self.resetted_visual_goal_states[:, 2] += goal_visual_displacement[2]
+
     def reset_object_states(self, env_ids):
         """
         reset the object states to the initial states for env_ids by setting self.resetted_object_states (which has shape (len(env_ids), 13))
         this implementation is for the in-hand reorientation task, but override it in your class if the reset procedure is different
-        """
         rand_floats = torch_rand_float(
             -1.0, 1.0, (len(env_ids), 5), self.device
         )
@@ -512,6 +542,17 @@ class RobotHand(VecTask):
             self.x_unit_tensor[env_ids],
             self.y_unit_tensor[env_ids],
         )
+        """
+        rand = torch_rand_float(-1.0, 1.0, (len(env_ids), 4), self.device)
+        self.resetted_object_states = self.object_init_states[env_ids].clone()
+    
+        # position noise
+        self.resetted_object_states[:, 0:3] += rand[:, 0:3] * self.cfg["reset_noise"]["object_pos"]
+    
+        # yaw-only initial orientation
+        yaw = rand[:, 3] * torch.pi
+        self.resetted_object_states[:, 3:7] = self._quat_yaw_only(yaw)
+        
 
     def custom_reset(self):
         """
@@ -1283,6 +1324,7 @@ class RobotHand(VecTask):
         object_init_states = []
         hand_indices = []
         object_indices = []
+        object_rb_indices = []   # SIM-domain rigid-body index for object body0 in each env
         goal_object_indices = []
         # one-hot encoding which saves the object type loaded in each environment
         self.object_type = torch.zeros([self.num_envs, len(self.cfg["env"]["object_type"])])
@@ -1330,6 +1372,8 @@ class RobotHand(VecTask):
             object_handle = self.gym.create_actor(
                 env_ptr, object_asset_list[object_index], object_start_pose, "object", i, 0, 1
             )
+            obj_rb0 = self.gym.get_actor_rigid_body_index(env_ptr, object_handle, 0, gymapi.DOMAIN_SIM)
+            object_rb_indices.append(obj_rb0)
             self.object_type[i][object_index] = 1
             object_init_states.append(
                 [
@@ -1360,7 +1404,7 @@ class RobotHand(VecTask):
                 0,
                 0,
             )
-
+            
             # save the indices of each item in the environment
             hand_idx = self.gym.get_actor_index(
                 env_ptr, actor_handle, gymapi.DOMAIN_SIM
@@ -1406,6 +1450,7 @@ class RobotHand(VecTask):
         self.pose_sensor_handles = to_torch(
             pose_sensor_handles, dtype=torch.long, device=self.device
         )
+        self.object_rb_indices = to_torch(object_rb_indices, dtype=torch.long, device=self.device)
 
 
 
@@ -1470,12 +1515,14 @@ class RobotHand(VecTask):
 
     # first define generic reward functions that can be used for any task
     def _reward_toss_penalty(self):
-        """
-        Penalize tossing of the object. limit the speed of object.
-        """
-        obj_linvel = self._observation_obj_linvel()     # (N,3)
-        speed = torch.norm(obj_linvel, dim=1)          # |v|
-        return speed * speed
+        obj_linvel = self._observation_obj_linvel()      # (N,3)
+        speed2 = torch.sum(obj_linvel**2, dim=-1)        # (N,)
+
+        contact_threshold_N = 0.5
+        no_contact = (self._object_contact_mag() <= contact_threshold_N)
+
+        return no_contact.float() * speed2
+
     
     def _reward_dof_acc_penalty(self):
         """
@@ -1487,19 +1534,41 @@ class RobotHand(VecTask):
         dof_trq = self.dof_force_tensor  # (E, D)
         return torch.mean(dof_trq**2, dim=-1)  # (E,)
         
-     
+    from isaacgym.torch_utils import quat_apply
+
+    def _reward_spin_clockwise(self):
+        # object angular velocity in world frame (N,3)
+        obj_angvel = self._observation_obj_angvel()
+        wz = obj_angvel[:, 2]  # (N,)
+
+        # target clockwise yaw-rate (rad/s). clockwise => negative wz in RH frame
+        target_wz = -float(self.cfg["task"]["spin"]["target_wz"])
+
+        # track target angular speed (quadratic tracking loss -> turn into reward)
+        err = wz - target_wz
+        r_spin = torch.exp(-float(self.cfg["task"]["spin"]["wz_k"]) * err * err)
+
+        # keep cube upright: penalize tilt (cube local z axis should align with world z)
+        obj_quat = self._observation_obj_quat()          # (N,4) xyzw
+        z_local = torch.zeros((obj_quat.shape[0], 3), device=self.device)
+        z_local[:, 2] = 1.0
+        z_world = quat_apply(obj_quat, z_local)          # (N,3)
+        tilt = 1.0 - z_world[:, 2].clamp(-1.0, 1.0)      # 0 when perfectly upright
+        r_upright = torch.exp(-float(self.cfg["task"]["spin"]["tilt_k"]) * tilt * tilt)
+
+        return r_spin * r_upright
 
     def _reward_dof_vel_penalty(self):
         """
         Penalize speed of the joints, smooth out movement
         return torch.norm(self.hand_dof_vel, p=2, dim=-1)
         """
-        dof_vel_threshold = 2.0
+        dof_vel_threshold = 0.3 #(rad/s)
         vel_excess = torch.clamp(torch.abs(self.hand_dof_vel) - dof_vel_threshold, min=0.0)
         return torch.mean(vel_excess ** 2, dim=-1)   # -> (num_envs,)
 
     def _reward_action_penalty(self):
-        """
+        """z
         Penalize the magnitude of the action
         """
         #return torch.norm(self.actions, p=2, dim=-1)
@@ -1511,7 +1580,7 @@ class RobotHand(VecTask):
         return torch.norm(self.dof_force_tensor, p=2, dim=-1)
         """
         dof_trq = self.dof_force_tensor  # shape (num_envs, num_dofs) typically
-        dof_trq_threshold = 1.0
+        dof_trq_threshold = 0.5
         trq_excess = torch.clamp(torch.abs(dof_trq) - dof_trq_threshold, min=0.0)
         return torch.norm(trq_excess, p=2, dim=-1)
 
