@@ -12,6 +12,9 @@ env:
   hand_start_p: [0,0,1]
   hand_reset_dof_pos: null
   hand_reset_dof_vel: 0.0
+  hand_friction: 0.2        # tower, joints, etc.
+  palm_friction: 0.8        # palm silicone
+  finger_friction: 0.8      # finger silicone
 
 asset:
   model_file: "orcahand_description/models/urdf/orcahand_right.urdf"

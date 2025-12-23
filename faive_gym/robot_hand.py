@@ -1126,6 +1126,28 @@ class RobotHand(VecTask):
         hand_asset = self.gym.load_asset(
             self.sim, asset_root, hand_asset_file, asset_options
         )
+
+        # ---------- Friction config ----------
+        cfg_env = self.cfg["env"]
+        default_mu   = float(cfg_env.get("hand_friction", 0.2))   # non-skin parts
+        palm_mu      = float(cfg_env.get("palm_friction", 0.8))   # palm skin
+        finger_mu    = float(cfg_env.get("finger_friction", 0.8)) #finger skin
+        
+        # Bodies that have skin meshes 
+        PALM_BODIES = {
+            "right_palm",
+        }
+        
+        FINGER_SKIN_BODIES = {
+            "right_index_pp", "right_index_ip",
+            "right_middle_pp", "right_middle_ip",
+            "right_pinky_pp", "right_pinky_ip",
+            "right_ring_pp", "right_ring_ip",
+            "right_thumb_ip", "right_thumb_dp",
+        }
+
+        
+        """
         # set up friction and restitution params
         # sphere rotation is somewhat brittle to these params...
         hand_props = self.gym.get_asset_rigid_shape_properties(hand_asset)
@@ -1134,6 +1156,8 @@ class RobotHand(VecTask):
             p.torsion_friction = self.cfg["env"]["hand_friction"]
             p.restitution = 0.8
         self.gym.set_asset_rigid_shape_properties(hand_asset, hand_props)
+        """
+        
 
         # define some variables based on the asset
         self.num_hand_bodies = self.gym.get_asset_rigid_body_count(hand_asset)
@@ -1141,9 +1165,32 @@ class RobotHand(VecTask):
             self.gym.get_asset_rigid_body_name(hand_asset, i)
             for i in range(self.num_hand_bodies)
         ]
-        print("[ORCA] Rigid bodies in ORCA asset:")
-        for i, n in enumerate(body_names):
-            print(f"  {i}: {n}")
+        shape_props = self.gym.get_asset_rigid_shape_properties(hand_asset)
+        body_shape_ranges  = self.gym.get_asset_rigid_body_shape_indices(hand_asset)
+        # len(body_shape_indices) == num_bodies + 1     
+
+        print("[ORCA] Rigid bodies and assigned friction:")
+        for body_idx, body_name in enumerate(body_names):
+            if body_name in PALM_BODIES:
+                mu = palm_mu
+            elif body_name in FINGER_SKIN_BODIES:
+                mu = finger_mu
+            else:
+                mu = default_mu     
+
+            print(f"  {body_idx:2d}  {body_name:30s}  mu={mu:.2f}")     
+
+            shape_range = body_shape_ranges[body_idx]
+            start = shape_range.start
+            end   = shape_range.start + shape_range.count
+
+            for si in range(start, end):
+                shape_props[si].friction         = mu
+                shape_props[si].torsion_friction = mu
+                shape_props[si].restitution      = 0.8   # keep / tune as needed     
+
+        self.gym.set_asset_rigid_shape_properties(hand_asset, shape_props)
+
         
         self.num_hand_shapes = self.gym.get_asset_rigid_shape_count(hand_asset)
         self.num_hand_dofs = self.gym.get_asset_dof_count(hand_asset)
@@ -1518,7 +1565,7 @@ class RobotHand(VecTask):
         obj_linvel = self._observation_obj_linvel()      # (N,3)
         speed2 = torch.sum(obj_linvel**2, dim=-1)        # (N,)
 
-        contact_threshold_N = 0.5
+        contact_threshold_N = 0.2
         no_contact = (self._object_contact_mag() <= contact_threshold_N)
 
         return no_contact.float() * speed2
@@ -1537,33 +1584,60 @@ class RobotHand(VecTask):
     from isaacgym.torch_utils import quat_apply
 
     def _reward_spin_clockwise(self):
-        # object angular velocity in world frame (N,3)
-        obj_angvel = self._observation_obj_angvel()
-        wz = obj_angvel[:, 2]  # (N,)
+        # -----------------------
+        # 1) Get yaw angular vel
+        # -----------------------
+        obj_angvel = self._observation_obj_angvel()  # (N, 3)
+        wz = obj_angvel[:, 2]                        # (N,)
 
-        # target clockwise yaw-rate (rad/s). clockwise => negative wz in RH frame
-        target_wz = -float(self.cfg["task"]["spin"]["target_wz"])
+        # In your convention: clockwise => negative wz
+        # Let config use a positive magnitude, e.g. target_wz = 6.0 (rad/s)
+        target_wz_mag = float(self.cfg["task"]["spin"]["target_wz"])   # > 0
+        wz_k          = float(self.cfg["task"]["spin"]["wz_k"])        # tracking sharpness
+        wrong_dir_pen = float(self.cfg["task"]["spin"].get("wrong_dir_penalty", 0.5))
 
-        # track target angular speed (quadratic tracking loss -> turn into reward)
-        err = wz - target_wz
-        r_spin = torch.exp(-float(self.cfg["task"]["spin"]["wz_k"]) * err * err)
+        # --------------------------------------
+        # 2) Direction gating: only reward CW
+        #    speed_cw = -wz (>=0 if CW)
+        # --------------------------------------
+        # speed_cw is "how fast clockwise" (0 if not CW)
+        speed_cw = torch.clamp(-wz, min=0.0)
 
-        # keep cube upright: penalize tilt (cube local z axis should align with world z)
-        obj_quat = self._observation_obj_quat()          # (N,4) xyzw
+        # Quadratic tracking on the *clockwise speed* only
+        # (if cube is not spinning CW, speed_cw ~ 0 => far from target, low reward)
+        err = speed_cw - target_wz_mag
+        r_speed = torch.exp(-wz_k * err * err)      # in [0,1]
+
+        # -------------------------------
+        # 3) Explicit penalty for CCW
+        # -------------------------------
+        # 1 if spinning the wrong way (CCW), 0 otherwise
+        wrong_dir = (wz > 0.0).float()
+        # subtract some reward if wrong_dir; clamp to keep reward >= 0
+        r_spin = r_speed - wrong_dir * wrong_dir_pen
+        r_spin = torch.clamp(r_spin, min=0.0)
+
+        # ---------------------------------------
+        # 4) Upright term (same as your version)
+        # ---------------------------------------
+        obj_quat = self._observation_obj_quat()  # (N,4) xyzw
         z_local = torch.zeros((obj_quat.shape[0], 3), device=self.device)
         z_local[:, 2] = 1.0
-        z_world = quat_apply(obj_quat, z_local)          # (N,3)
-        tilt = 1.0 - z_world[:, 2].clamp(-1.0, 1.0)      # 0 when perfectly upright
-        r_upright = torch.exp(-float(self.cfg["task"]["spin"]["tilt_k"]) * tilt * tilt)
+        z_world = quat_apply(obj_quat, z_local)  # (N,3)
 
-        return r_spin * r_upright
+        # 0 when perfectly upright, grows with tilt
+        tilt = 1.0 - z_world[:, 2].clamp(-1.0, 1.0)
+        tilt_k = float(self.cfg["task"]["spin"]["tilt_k"])
+        r_upright = torch.exp(-tilt_k * tilt * tilt)
+
+        return 2*r_spin+ 0.1* r_upright
 
     def _reward_dof_vel_penalty(self):
         """
         Penalize speed of the joints, smooth out movement
         return torch.norm(self.hand_dof_vel, p=2, dim=-1)
         """
-        dof_vel_threshold = 0.3 #(rad/s)
+        dof_vel_threshold = 1.5 #(rad/s)
         vel_excess = torch.clamp(torch.abs(self.hand_dof_vel) - dof_vel_threshold, min=0.0)
         return torch.mean(vel_excess ** 2, dim=-1)   # -> (num_envs,)
 

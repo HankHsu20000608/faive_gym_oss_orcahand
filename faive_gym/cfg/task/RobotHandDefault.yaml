@@ -81,15 +81,16 @@ rewards:
     spin_clockwise: 1.0         # new main objective (positive)
     
 
-    toss_penalty: -0.02 
+    toss_penalty: 0.0 #0.02
     
 
-    action_penalty: -0.000002
-    dof_acc_penalty: -0.0005  # 0.0
-    dof_vel_penalty: -0.5  # 0.0
-    dof_trq_penalty: -0.001 #0.0
+    action_penalty: 0.0 #-0.000002
+    dof_acc_penalty: -0.1 
+     # 0.0
+    dof_vel_penalty: -0.01 # 0.0
+    dof_trq_penalty: -0.01 #0.0
     success: 0.0 #3.0
-    drop_penalty: -0.0001
+    drop_penalty: -0.01
     simple_hand_flat: 0.0
   
     reorienttask_obj_dist: -0.05
@@ -170,9 +171,10 @@ reset_noise:
 task:
   randomize: True
   spin: 
-    target_wz: 6.0   # rad/s, tune (start 2~6)
-    wz_k: 0.2        # tracking sharpness (start 0.05~0.3)
-    tilt_k: 5.0      # upright importance (start 2~10)
+    target_wz: 2.5        # magnitude of desired CW speed (rad/s)
+    wz_k: 0.1            # sharpness; smaller -> wider “good” band
+    tilt_k: 2.0           # upright penalty strength
+    wrong_dir_penalty: 0.5
   randomization_params:
     frequency: 1
     actor_params:

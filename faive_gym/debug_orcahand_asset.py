@@ -35,48 +35,48 @@ body_count: 42
 15 right_thumb_pip driveMode= 0
 16 right_thumb_dip driveMode= 0
 
-Rigid bodies:
+Rigid bodies:(#:with skin)
 0 world
 1 world2right_tower_fixed_jointbody
 2 right_tower
 3 right_wrist_jointbody
-4 right_palm
+4 right_palm                        #
 5 right_index_abd_jointbody
 6 right_index_mp
 7 right_index_mcp_jointbody
-8 right_index_pp
+8 right_index_pp                    #
 9 right_index_pip_jointbody
-10 right_index_ip
+10 right_index_ip                   #
 11 right_index_fingertip
 12 right_middle_abd_jointbody
 13 right_middle_mp
 14 right_middle_mcp_jointbody
-15 right_middle_pp
+15 right_middle_pp                  #
 16 right_middle_pip_jointbody
-17 right_middle_ip
+17 right_middle_ip                  #
 18 right_middle_fingertip
 19 right_pinky_abd_jointbody
 20 right_pinky_mp
 21 right_pinky_mcp_jointbody
-22 right_pinky_pp
+22 right_pinky_pp                   #
 23 right_pinky_pip_jointbody
-24 right_pinky_ip
+24 right_pinky_ip                   #
 25 right_pinky_fingertip
 26 right_ring_abd_jointbody
 27 right_ring_mp
 28 right_ring_mcp_jointbody
-29 right_ring_pp
+29 right_ring_pp                    #
 30 right_ring_pip_jointbody
-31 right_ring_ip
+31 right_ring_ip                    #
 32 right_ring_fingertip
 33 right_thumb_mcp_jointbody
 34 right_thumb_mp
 35 right_thumb_abd_jointbody
 36 right_thumb_pp
 37 right_thumb_pip_jointbody
-38 right_thumb_ip
+38 right_thumb_ip                   #
 39 right_thumb_dip_jointbody
-40 right_thumb_dp
+40 right_thumb_dp                   #
 41 right_thumb_fingertip
 
 """
