@@ -14,12 +14,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
+#start env
 conda activate rlhand
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 cd Desktop/orca_hand/faive_gym_oss/faive_gym
+
+#for test the training process wo wandb
 python train.py num_envs=2 task=orcahand_random
+
+#for a new training in wandb 
 python train.py task=orcahand_random   wandb_activate=True   wandb_entity=comp4471   wandb_project=rl_OrcaHand   wandb_group=Orca   wandb_name=test_run_orcarandom
+
+#for training from a existing chackpoint in wandb
+python train.py task=orcahand_random   wandb_activate=True   wandb_entity=comp4471   wandb_project=rl_OrcaHand   wandb_group=Orca   wandb_name=test_run_orcarandom checkpoint=runs/FaiveHand/nn/251223/last_FaiveHand_ep_2600_rew_697.99646.pth
+
+#for testing a checkpoint
 python train.py task=orcahand num_envs=1 test=True force_render=True checkpoint=runs/FaiveHand/nn/FaiveHand.pth
+
 
 
 """
@@ -1125,13 +1136,16 @@ class RobotHand(VecTask):
 
         hand_asset = self.gym.load_asset(
             self.sim, asset_root, hand_asset_file, asset_options
-        )
+        )   
 
         # ---------- Friction config ----------
-        cfg_env = self.cfg["env"]
-        default_mu   = float(cfg_env.get("hand_friction", 0.2))   # non-skin parts
-        palm_mu      = float(cfg_env.get("palm_friction", 0.8))   # palm skin
-        finger_mu    = float(cfg_env.get("finger_friction", 0.8)) #finger skin
+        PALM_SKIN_SHAPES   = [4]
+        FINGER_SKIN_SHAPES = [7, 9, 12, 14, 17, 19, 22, 24, 28, 30]
+        SKIN_SHAPES = PALM_SKIN_SHAPES + FINGER_SKIN_SHAPES
+
+        # Safety check: ensure indices exist for this asset
+        n_shapes = self.gym.get_asset_rigid_shape_count(hand_asset)
+        assert max(SKIN_SHAPES) < n_shapes, f"Skin shape id out of range: max={max(SKIN_SHAPES)} n_shapes={n_shapes}"
         
         # Bodies that have skin meshes 
         PALM_BODIES = {
@@ -1158,40 +1172,7 @@ class RobotHand(VecTask):
         self.gym.set_asset_rigid_shape_properties(hand_asset, hand_props)
         """
         
-
-        # define some variables based on the asset
         self.num_hand_bodies = self.gym.get_asset_rigid_body_count(hand_asset)
-        body_names = [
-            self.gym.get_asset_rigid_body_name(hand_asset, i)
-            for i in range(self.num_hand_bodies)
-        ]
-        shape_props = self.gym.get_asset_rigid_shape_properties(hand_asset)
-        body_shape_ranges  = self.gym.get_asset_rigid_body_shape_indices(hand_asset)
-        # len(body_shape_indices) == num_bodies + 1     
-
-        print("[ORCA] Rigid bodies and assigned friction:")
-        for body_idx, body_name in enumerate(body_names):
-            if body_name in PALM_BODIES:
-                mu = palm_mu
-            elif body_name in FINGER_SKIN_BODIES:
-                mu = finger_mu
-            else:
-                mu = default_mu     
-
-            print(f"  {body_idx:2d}  {body_name:30s}  mu={mu:.2f}")     
-
-            shape_range = body_shape_ranges[body_idx]
-            start = shape_range.start
-            end   = shape_range.start + shape_range.count
-
-            for si in range(start, end):
-                shape_props[si].friction         = mu
-                shape_props[si].torsion_friction = mu
-                shape_props[si].restitution      = 0.8   # keep / tune as needed     
-
-        self.gym.set_asset_rigid_shape_properties(hand_asset, shape_props)
-
-        
         self.num_hand_shapes = self.gym.get_asset_rigid_shape_count(hand_asset)
         self.num_hand_dofs = self.gym.get_asset_dof_count(hand_asset)
         self.num_hand_actuators = self.gym.get_asset_actuator_count(hand_asset)
@@ -1235,7 +1216,7 @@ class RobotHand(VecTask):
             hand_dof_props["driveMode"][:] = gymapi.DOF_MODE_POS
 
             # PD gains – starting guess, you can tune these
-            hand_dof_props["stiffness"][:] = 1800.0   # try 800–2500
+            hand_dof_props["stiffness"][:] = 1200.0   # try 800–2500
             hand_dof_props["damping"][:]   = 180.0    # try 60–200
         # load joint range information
         self.hand_dof_lower_limits = []
@@ -1386,6 +1367,27 @@ class RobotHand(VecTask):
             actor_handle = self.gym.create_actor(
                 env_ptr, hand_asset, hand_start_pose, "hand", i, -1, 0
             )
+            # After create_actor(...)
+            shape_props = self.gym.get_actor_rigid_shape_properties(env_ptr, actor_handle)          
+
+            cfg_env = self.cfg["env"]
+            default_mu = float(cfg_env.get("hand_friction", 0.2))  # for non-skin shapes
+            skin_mu    = float(cfg_env.get("skin_friction", 0.8))  # for skin shapes            
+
+            restitution = float(cfg_env.get("hand_restitution", 0.2))           
+
+            # 1) Set defaults for ALL shapes (non-skin)
+            for sp in shape_props:
+                sp.friction = default_mu
+                sp.torsion_friction = default_mu
+                sp.restitution = restitution            
+
+            # 2) Override SKIN shapes only
+            for sid in SKIN_SHAPES:
+                shape_props[sid].friction = skin_mu
+                shape_props[sid].torsion_friction = skin_mu         
+
+            self.gym.set_actor_rigid_shape_properties(env_ptr, actor_handle, shape_props)
             self.gym.set_actor_dof_properties(env_ptr, actor_handle, hand_dof_props)
 
             self.gym.enable_actor_dof_force_sensors(
@@ -1576,10 +1578,9 @@ class RobotHand(VecTask):
         Penalize joint acceleration, could remove shaking
         return torch.norm(self.dof_acceleration, p=2, dim=-1)
         """
-        #return torch.norm(self.dof_acceleration, p=2, dim=-1)
+        return torch.norm(self.dof_acceleration, p=2, dim=-1)
 
-        dof_trq = self.dof_force_tensor  # (E, D)
-        return torch.mean(dof_trq**2, dim=-1)  # (E,)
+        
         
     from isaacgym.torch_utils import quat_apply
 
@@ -1630,7 +1631,7 @@ class RobotHand(VecTask):
         tilt_k = float(self.cfg["task"]["spin"]["tilt_k"])
         r_upright = torch.exp(-tilt_k * tilt * tilt)
 
-        return 2*r_spin+ 0.1* r_upright
+        return 2*r_spin+ 0.05* r_upright
 
     def _reward_dof_vel_penalty(self):
         """

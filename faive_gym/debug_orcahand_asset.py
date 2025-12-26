@@ -5,7 +5,7 @@ sim_params = gymapi.SimParams()
 sim = gym.create_sim(0, 0, gymapi.SIM_PHYSX, sim_params)
 
 asset_root = "/home/fw3/Desktop/orca_hand/faive_gym_oss/assets"
-asset_file = "orcahand/models/urdf/orcahand_right.urdf"
+asset_file = "orcahand_description/models/urdf/orcahand_right.urdf"
 
 asset_opts = gymapi.AssetOptions()
 asset = gym.load_asset(sim, asset_root, asset_file, asset_opts)
@@ -13,6 +13,77 @@ asset = gym.load_asset(sim, asset_root, asset_file, asset_opts)
 print("Rigid bodies:")
 for i in range(gym.get_asset_rigid_body_count(asset)):
     print(i, gym.get_asset_rigid_body_name(asset, i))
+import os
+import xml.etree.ElementTree as ET
+from isaacgym import gymapi
+
+def urdf_collision_meshes_by_link(urdf_abspath: str):
+    """link_name -> list of collision mesh filenames (URDF order)"""
+    root = ET.parse(urdf_abspath).getroot()
+    out = {}
+    for link in root.findall("link"):
+        lname = link.get("name")
+        cols = []
+        for col in link.findall("collision"):
+            geom = col.find("geometry")
+            if geom is None:
+                continue
+            mesh = geom.find("mesh")
+            if mesh is not None and mesh.get("filename"):
+                cols.append(mesh.get("filename"))
+        if cols:
+            out[lname] = cols
+    return out
+
+def compute_skin_shape_ids(gym, sim, asset_root, asset_file, skin_keyword="skin"):
+    urdf_path = os.path.join(asset_root, asset_file)
+    col_by_link = urdf_collision_meshes_by_link(urdf_path)
+
+    # Non-collapsed asset for mapping
+    opts = gymapi.AssetOptions()
+    opts.fix_base_link = True
+    opts.collapse_fixed_joints = False
+    asset_nc = gym.load_asset(sim, asset_root, asset_file, opts)
+
+    nb = gym.get_asset_rigid_body_count(asset_nc)
+    body_names = [gym.get_asset_rigid_body_name(asset_nc, i) for i in range(nb)]
+
+    # This is a list of IndexRange (start,count) per rigid body
+    body_shape_ranges = gym.get_asset_rigid_body_shape_indices(asset_nc)
+
+    skin_shape_ids = []
+
+    for bi, bname in enumerate(body_names):
+        if bname not in col_by_link:
+            continue
+
+        collision_meshes = col_by_link[bname]
+
+        r = body_shape_ranges[bi]
+        start = r.start
+        count = r.count
+
+        # Helpful debug to validate mapping assumptions
+        if count != len(collision_meshes):
+            print(f"[WARN] {bname}: shapes={count} vs urdf_collisions={len(collision_meshes)}")
+            # This can happen if primitives exist, or fixed-child collisions fold into this link, etc.
+
+        # Best-effort mapping: assume URDF collision order corresponds to shape order for that link
+        for local_ci, mesh_fn in enumerate(collision_meshes):
+            if skin_keyword in mesh_fn:
+                sid = start + local_ci
+                if local_ci >= count:
+                    print(f"[WARN] {bname}: local_ci={local_ci} exceeds shape count {count}; skip")
+                    continue
+                skin_shape_ids.append(sid)
+                print(f"[skin] link={bname} local={local_ci} shape_id={sid} mesh={mesh_fn}")
+
+    skin_shape_ids = sorted(set(skin_shape_ids))
+    print("skin_shape_ids:", skin_shape_ids)
+    return skin_shape_ids
+
+# Example usage:
+skin_shape_ids = compute_skin_shape_ids(gym, sim, asset_root, asset_file)
 
 """
 dof_count: 17
